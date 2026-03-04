@@ -15,13 +15,22 @@
 package containercollection
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
+	"errors"
 	"fmt"
+	"io"
 	"math"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 
@@ -49,6 +58,8 @@ type K8sClient struct {
 	runtimeClient runtimeclient.ContainerRuntimeClient
 	RuntimeConfig *containerutilsTypes.RuntimeConfig
 }
+
+const kubeletPort = "10250"
 
 func NewK8sClient(nodeName string, kubeconfigPath string, userAgentComment string) (*K8sClient, error) {
 	clientset, err := k8sutil.NewClientset(kubeconfigPath, userAgentComment)
@@ -257,18 +268,122 @@ func getContainerRuntimeSocketPath(clientset *kubernetes.Clientset, nodeName str
 	return socketPath, nil
 }
 
-// The /configz endpoint isn't officially documented. It was introduced in Kubernetes 1.26 and been around for a long time
-// as stated in https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/component-base/configz/OWNERS
+func getNodeInternalIP(node *v1.Node) (string, error) {
+	for _, a := range node.Status.Addresses {
+		if a.Type == v1.NodeInternalIP && a.Address != "" {
+			return a.Address, nil
+		}
+	}
+	return "", fmt.Errorf("no internal IP found for node %q", node.Name)
+}
+
+func fetchKubeletCACert(hostIP string) ([]byte, error) {
+	addr := net.JoinHostPort(hostIP, kubeletPort)
+
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	conn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
+		// We dial the kubelet on localhost (hostNetwork pod,
+		// 127.0.0.1:10250). Traffic never leaves the node.
+		// An attacker able to MITM this already has root on the node
+		// and owns the kubelet.
+		InsecureSkipVerify: true, //nolint:gosec
+	})
+	if err != nil {
+		return nil, fmt.Errorf("TLS dial %s: %w", addr, err)
+	}
+	defer conn.Close()
+
+	certs := conn.ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		return nil, fmt.Errorf("no peer certificates received from %s", addr)
+	}
+
+	// Store ALL certificates from the chain.
+	// This mirrors what kubelet CA files (e.g. minikube's ca.crt) contain:
+	// the full trust chain needed to verify the TLS connection.
+	var buf bytes.Buffer
+	for _, c := range certs {
+		if err := pem.Encode(&buf, &pem.Block{
+			Type:  "CERTIFICATE",
+			Bytes: c.Raw,
+		}); err != nil {
+			return nil, fmt.Errorf("PEM encode: %w", err)
+		}
+	}
+
+	return buf.Bytes(), nil
+}
+
+func getCurrentKubeletConfigThroughNodesConfigz(ctx context.Context, clientset *kubernetes.Clientset, nodeName string) ([]byte, error) {
+	node, err := clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("getting node %q: %w", nodeName, err)
+	}
+
+	nodeIP, err := getNodeInternalIP(node)
+	if err != nil {
+		return nil, fmt.Errorf("getting node internal IP: %w", err)
+	}
+
+	kubeletCA, err := fetchKubeletCACert(nodeIP)
+	if err != nil {
+		return nil, fmt.Errorf("fetching kubelet CA: %w", err)
+	}
+
+	token, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
+	if err != nil {
+		return nil, fmt.Errorf("reading service account token: %w", err)
+	}
+
+	rootCAs := x509.NewCertPool()
+	if !rootCAs.AppendCertsFromPEM(kubeletCA) {
+		return nil, errors.New("parsing kubelet certificate")
+	}
+
+	// Let's dialog with the kubelet through HTTPS.
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				MinVersion: tls.VersionTLS12,
+				RootCAs:    rootCAs,
+				ServerName: nodeName,
+			},
+			Proxy: http.ProxyFromEnvironment,
+		},
+		Timeout: 5 * time.Second,
+	}
+	url := fmt.Sprintf("https://%s:%s/configz", nodeIP, kubeletPort)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("building http request to kubelet %q: %w", url, err)
+	}
+	req.Header.Set("Authorization", "Bearer "+string(token))
+
+	response, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("getting kubelet /configz at %q: %w", url, err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("kubelet /configz status is %d, expected: %d", response.StatusCode, http.StatusOK)
+	}
+
+	return io.ReadAll(io.LimitReader(response.Body, 5<<20 /* 5MiB */))
+}
+
 func getCurrentKubeletConfig(clientset *kubernetes.Clientset, nodeName string) (*kubeletconfigv1beta1.KubeletConfiguration, error) {
-	resp, err := clientset.CoreV1().RESTClient().Get().Resource("nodes").
-		Name(nodeName).Suffix("proxy", "configz").DoRaw(context.TODO())
+	resp, err := getCurrentKubeletConfigThroughNodesConfigz(context.TODO(), clientset, nodeName)
 	if err != nil {
 		return nil, fmt.Errorf("fetching /configz from %q: %w", nodeName, err)
 	}
+
 	kubeCfg, err := decodeConfigz(resp)
 	if err != nil {
 		return nil, err
 	}
+
 	return kubeCfg, nil
 }
 
