@@ -323,8 +323,15 @@ is enabled by default, see
 On older clusters (before v1.33), or on distributions where the kubelet API
 authorization feature gate has been explicitly disabled, socket path
 auto-detection is not available. Inspektor Gadget will log a warning and fall
-back to the configured socket path. If the default path does not match your
-setup, you can set it explicitly in a daemon configuration file:
+back to the configured socket path:
+
+```
+time="2026-08-10T14:36:21Z" level=warning msg="Failed to retrieve socket path for runtime client from kubelet: getting /configz: fetching /configz from \"minikube-docker\": kubelet /configz status is 403, expected: 200. Falling back to default container runtime"
+time="2026-08-10T14:36:21Z" level=warning msg="Failed to retrieve socket path for runtime client from kubelet: getting /configz: fetching /configz from \"minikube-docker\": kubelet /configz status is 403, expected: 200. Falling back to default container runtime"
+```
+
+If the default path does not match your setup, you can set it explicitly in a
+daemon configuration file:
 
 ```yaml
 # daemon-config.yaml

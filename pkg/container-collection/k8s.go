@@ -15,17 +15,12 @@
 package containercollection
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
-	"errors"
 	"fmt"
 	"io"
 	"math"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -277,43 +272,6 @@ func getNodeInternalIP(node *v1.Node) (string, error) {
 	return "", fmt.Errorf("no internal IP found for node %q", node.Name)
 }
 
-func fetchKubeletCACert(hostIP string) ([]byte, error) {
-	addr := net.JoinHostPort(hostIP, kubeletPort)
-
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	conn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{
-		// We dial the kubelet on localhost (hostNetwork pod,
-		// 127.0.0.1:10250). Traffic never leaves the node.
-		// An attacker able to MITM this already has root on the node
-		// and owns the kubelet.
-		InsecureSkipVerify: true, //nolint:gosec
-	})
-	if err != nil {
-		return nil, fmt.Errorf("TLS dial %s: %w", addr, err)
-	}
-	defer conn.Close()
-
-	certs := conn.ConnectionState().PeerCertificates
-	if len(certs) == 0 {
-		return nil, fmt.Errorf("no peer certificates received from %s", addr)
-	}
-
-	// Store ALL certificates from the chain.
-	// This mirrors what kubelet CA files (e.g. minikube's ca.crt) contain:
-	// the full trust chain needed to verify the TLS connection.
-	var buf bytes.Buffer
-	for _, c := range certs {
-		if err := pem.Encode(&buf, &pem.Block{
-			Type:  "CERTIFICATE",
-			Bytes: c.Raw,
-		}); err != nil {
-			return nil, fmt.Errorf("PEM encode: %w", err)
-		}
-	}
-
-	return buf.Bytes(), nil
-}
-
 func getCurrentKubeletConfigThroughNodesConfigz(ctx context.Context, clientset *kubernetes.Clientset, nodeName string) ([]byte, error) {
 	node, err := clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 	if err != nil {
@@ -325,19 +283,9 @@ func getCurrentKubeletConfigThroughNodesConfigz(ctx context.Context, clientset *
 		return nil, fmt.Errorf("getting node internal IP: %w", err)
 	}
 
-	kubeletCA, err := fetchKubeletCACert(nodeIP)
-	if err != nil {
-		return nil, fmt.Errorf("fetching kubelet CA: %w", err)
-	}
-
 	token, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
 	if err != nil {
 		return nil, fmt.Errorf("reading service account token: %w", err)
-	}
-
-	rootCAs := x509.NewCertPool()
-	if !rootCAs.AppendCertsFromPEM(kubeletCA) {
-		return nil, errors.New("parsing kubelet certificate")
 	}
 
 	// Let's dialog with the kubelet through HTTPS.
@@ -345,10 +293,25 @@ func getCurrentKubeletConfigThroughNodesConfigz(ctx context.Context, clientset *
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
 				MinVersion: tls.VersionTLS12,
-				RootCAs:    rootCAs,
-				ServerName: nodeName,
+				// We cannot verify the kubelet serving
+				// certificate: there is no portable way to get
+				// the kubelet CA (it depends on the
+				// distribution), and fetching it from the
+				// kubelet itself would only verify the peer
+				// against the cert it just presented.
+				// Proxy is disabled so the request cannot
+				// leave the node; intercepting it requires
+				// host/CNI level control, at which point the
+				// attacker already owns the kubelet and our
+				// privileged pod.
+				// Same trade-off as node-feature-discovery's
+				// topology-updater:
+				// https://github.com/kubernetes-sigs/node-feature-discovery/blob/b35e1db7e862/pkg/nfd-topology-updater/nfd-topology-updater.go#L561-L573
+				// https://github.com/kubernetes-sigs/node-feature-discovery/blob/76e6cc8cc0d5/pkg/utils/kubeconf/kubelet_configz.go#L82
+				InsecureSkipVerify: true, //nolint:gosec
+				ServerName:         nodeName,
 			},
-			Proxy: http.ProxyFromEnvironment,
+			Proxy: nil,
 		},
 		Timeout: 5 * time.Second,
 	}
